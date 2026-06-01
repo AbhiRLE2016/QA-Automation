@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# Python / pytest
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Run-time state that should NEVER be committed
+# ---------------------------------------------------------------------------
+# Agent stop signal (sentinel file polled by stream_command)
+reports/.stop_signal
+# Playwright auth state cache
+reports/.storage_state.json
+# Browser-process logs
+agent_ui.log
+generation_log.txt
+
+# ---------------------------------------------------------------------------
+# Per-run snapshots — accumulate without bound, not useful in git
+# (user explicitly chose to exclude these)
+# ---------------------------------------------------------------------------
+projects/*/*/reports/runs/
+
+# ---------------------------------------------------------------------------
+# Local-only stash for the demo replay (not for shared use)
+# ---------------------------------------------------------------------------
+projects/*/*/.demo_stash/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---------------------------------------------------------------------------
+# Optional sidecar test data the user uploaded — keep out of git so secrets
+# in CSV/JSON test files aren't accidentally published.
+# ---------------------------------------------------------------------------
+user_data.json
+user_data.csv
+user_data.tsv
+user_data.xlsx
+user_data.xls
+
+# MCP browser session logs + DOM snapshots (cache, not source)
+.playwright-mcp/
+.claude/

@@ -1,0 +1,5 @@
+pytest
+pytest-bdd
+playwright
+pytest-html
+allure-pytest>=2.13.3

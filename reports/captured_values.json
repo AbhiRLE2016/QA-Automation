@@ -1,0 +1,120 @@
+{
+  "captures": [
+    {
+      "label": "Opened URL",
+      "value": "http://localhost:5173/",
+      "ts": "12:44:07",
+      "kind": "value"
+    },
+    {
+      "label": "App reachable at base URL",
+      "kind": "prerequisite",
+      "passed": true,
+      "reason": "",
+      "evidence": "",
+      "ts": "12:44:07"
+    },
+    {
+      "label": "Manager ID entered",
+      "value": "499",
+      "ts": "12:44:10",
+      "kind": "value"
+    },
+    {
+      "label": "Password entered (masked)",
+      "value": "*************",
+      "ts": "12:44:12",
+      "kind": "value"
+    },
+    {
+      "label": "Clicked button",
+      "value": "Login",
+      "ts": "12:44:14",
+      "kind": "value"
+    },
+    {
+      "label": "Clicked button",
+      "value": "View All Employees",
+      "ts": "12:44:16",
+      "kind": "value"
+    },
+    {
+      "label": "All Employees URL",
+      "value": "http://localhost:5173/all-employees/499",
+      "ts": "12:44:17",
+      "kind": "value"
+    },
+    {
+      "label": "All Employees URL ends with expected path",
+      "kind": "assertion",
+      "expected": "/all-employees/499",
+      "actual": "/all-employees/499",
+      "passed": true,
+      "ts": "12:44:17"
+    },
+    {
+      "label": "Filter selected",
+      "value": "All Employees (98)",
+      "ts": "12:44:19",
+      "kind": "value"
+    },
+    {
+      "label": "Filter selection starts with requested label",
+      "kind": "assertion",
+      "expected": "all employees",
+      "actual": "all employees",
+      "passed": true,
+      "ts": "12:44:19"
+    },
+    {
+      "label": "Search box value",
+      "value": "Priya Sharma",
+      "ts": "12:44:22",
+      "kind": "value"
+    },
+    {
+      "label": "Search box contents",
+      "kind": "assertion",
+      "expected": "Priya Sharma",
+      "actual": "Priya Sharma",
+      "passed": true,
+      "ts": "12:44:22"
+    },
+    {
+      "label": "Dashboard URL",
+      "value": "http://localhost:5173/dashboard/499",
+      "ts": "12:44:24",
+      "kind": "value"
+    },
+    {
+      "label": "Dashboard URL ends with expected path",
+      "kind": "assertion",
+      "expected": "/dashboard/499",
+      "actual": "/dashboard/499",
+      "passed": true,
+      "ts": "12:44:24"
+    },
+    {
+      "label": "Manage Employees tab active",
+      "value": "yes",
+      "ts": "12:44:26",
+      "kind": "value"
+    },
+    {
+      "label": "Manage Employees tab selected",
+      "kind": "assertion",
+      "expected": "yes",
+      "actual": "yes",
+      "passed": true,
+      "ts": "12:44:26"
+    },
+    {
+      "label": "Locate 'Priya Sharma' on Manage Employees table",
+      "kind": "prerequisite",
+      "passed": false,
+      "reason": "Employee 'Priya Sharma' is not present in the Manage Employees table for manager 499. The story expects this row to exist; since it does not, the delete cannot proceed. Reporting and halting per NO-FABRICATION rule (do NOT auto-add the employee).",
+      "evidence": "",
+      "ts": "12:44:27"
+    }
+  ]
+}
