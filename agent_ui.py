@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import datetime as _dt
 import hashlib
 import json
@@ -377,6 +378,33 @@ unless the step def calls `download.save_as(...)` with the suggested filename.
     Q: Was that mutation explicitly named in the user story?
     → If mutation YES and named NO → DELETE THE CODE. Use record_missing
       or assert_prerequisite instead.
+
+  ACTION OUTCOME MUST BE PROVEN BY THE BACKEND'S RESPONSE — never by a \
+  pre-existing match. When the story performs a create / add / submit / save / \
+  update / register action, the test MUST confirm the action SUCCEEDED ON THIS \
+  RUN. The authoritative signal is the application's own response, not the mere \
+  presence of a matching row:
+    · An error message or error toast — "already exists", "Error: …", \
+      "duplicate", "validation failed", "cannot …", "invalid", "failed" — is a \
+      DEFINITIVE FAILURE. The action did NOT happen.
+    · A positive outcome must be produced BY THIS RUN — the success toast, OR \
+      the list/count incrementing (count_after == count_before + 1). It is \
+      FORBIDDEN to report success just because the email/name is already in the \
+      list: that record may be left over from a previous run, and "already \
+      exists" means THIS run's creation failed. `email_present` alone is NOT \
+      proof of creation.
+    · USE THE READY-MADE HELPER `cap.assert_action_succeeded(...)` for this — \
+      it detects backend error toasts and raises (blocking) so you never \
+      hand-roll the check:
+          toast = modal.latest_error_toast_text()    # "" when none
+          cap.add("Add User — server response", toast or "<none>")
+          cap.assert_action_succeeded(
+              "User created",
+              error_text=toast,                       # any error text => FAIL
+              positive_signal=(count_after == (count_before or 0) + 1),
+              reason="user count did not increase — creation not confirmed",
+              evidence=f"count_before={count_before} count_after={count_after}",
+          )
 
   MISSING-DATA / NEGATIVE-PATH RULE — NEVER silently skip, NEVER mask:
 
@@ -2193,6 +2221,58 @@ def reset_pytest_plugins() -> None:
         CONFTEST_PATH.write_text(new_text, encoding="utf-8")
 
 
+def sync_pytest_plugins() -> list[str]:
+    """Deterministically register the active story's step-def modules in the
+    root conftest's `pytest_plugins`.
+
+    This is what makes pytest-bdd discover @given/@when/@then. Without it every
+    scenario dies at its first step with StepDefinitionNotFoundError. We do NOT
+    trust the LLM to edit pytest_plugins — it sometimes forgets, or puts an
+    ineffective `from step_defs import <module>` in the test file (which imports
+    the module object but does NOT expose pytest-bdd's injected step fixtures).
+    Instead we derive the plugin list from the artifacts actually on disk.
+
+    Mapping rule (matches the current FRAMEWORK_PROMPT: one step file per
+    feature, named /step_defs/<feature_stem>_steps.py):
+
+      * Register the step module that corresponds to each present feature, and
+        SKIP stale/reused step modules whose feature is NOT part of this story.
+        (A reused login POM can drag along an unrelated *_steps.py whose generic
+        patterns — 'the user navigates to ...', 'the user clicks on ...' —
+        would collide with the active story's steps.)
+      * Fallback: if nothing matches by name (LLM deviated from the naming
+        convention), register every *_steps.py so we register SOMETHING rather
+        than nothing — mirrors the older shared-steps projects.
+
+    Returns the list of dotted module paths written (for logging)."""
+    if not CONFTEST_PATH.exists():
+        return []
+    feature_stems = (
+        {p.stem for p in FEATURES_DIR.glob("*.feature")}
+        if FEATURES_DIR.exists() else set()
+    )
+    all_steps = sorted(
+        p.stem for p in STEP_DEFS_DIR.glob("*_steps.py")
+    ) if STEP_DEFS_DIR.exists() else []
+    matched = [
+        s for s in all_steps
+        if any(s == f"{fstem}_steps" for fstem in feature_stems)
+    ]
+    modules = matched or all_steps
+    plugins = tuple(f"step_defs.{m}" for m in modules)
+
+    text = CONFTEST_PATH.read_text(encoding="utf-8")
+    new_text = re.sub(
+        r"pytest_plugins\s*=\s*\([^)]*\)",
+        f"pytest_plugins = {plugins!r}",
+        text,
+        count=1,
+    )
+    if new_text != text:
+        CONFTEST_PATH.write_text(new_text, encoding="utf-8")
+    return list(plugins)
+
+
 def reset_locators() -> None:
     LOCATORS_PATH.parent.mkdir(parents=True, exist_ok=True)
     LOCATORS_PATH.write_text("{}\n", encoding="utf-8")
@@ -2230,6 +2310,119 @@ def _load_captured_values() -> list[dict]:
     return []
 
 
+def _load_step_trace() -> list[dict]:
+    """Per-step records (keyword/name/status/screenshot) written by conftest's
+    pytest_bdd_after_step / pytest_bdd_step_error hooks during the run."""
+    p = REPORTS_DIR / "step_trace.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    steps = data.get("steps") if isinstance(data, dict) else data
+    return list(steps or [])
+
+
+def _img_data_uri(rel_path: str) -> str:
+    """Inline a screenshot (path relative to reports/) as a base64 data URI so
+    the report HTML is fully self-contained and portable."""
+    if not rel_path:
+        return ""
+    fp = REPORTS_DIR / rel_path
+    try:
+        raw = fp.read_bytes()
+    except OSError:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+
+def _render_step_card(s: dict) -> str:
+    """One screenshot card for a single step (used only for the important
+    frames — failed steps, or the final frame of a clean run)."""
+    is_fail = s.get("status") == "failed"
+    cls = "step-fail" if is_fail else "step-pass"
+    badge = "✗ FAIL" if is_fail else "✓ PASS"
+    # Prefer a pre-embedded data URI (used by the suite report, captured before
+    # the next story's run overwrites reports/screenshots/); else read the file.
+    uri = s.get("_datauri") or _img_data_uri(s.get("screenshot", ""))
+    if not uri:
+        return ""
+    err = ""
+    if is_fail and s.get("error"):
+        err = (f"<div class='step-error'>"
+               f"{_esc(_shorten(s.get('error'), 300))}</div>")
+    return (
+        f"<div class='step-card {cls}'>"
+        f"<div class='step-head'>"
+        f"<span class='step-idx'>{_esc(s.get('index'))}</span>"
+        f"<span class='step-kw'>{_esc(s.get('keyword', ''))}</span> "
+        f"{_esc(s.get('name', ''))}"
+        f"<span class='step-badge {cls}'>{badge}</span>{err}</div>"
+        f"<a href='{uri}' target='_blank'>"
+        f"<img class='step-shot' src='{uri}' alt='step {_esc(s.get('index'))}'></a>"
+        f"</div>"
+    )
+
+
+def _render_step_timeline(steps: list[dict]) -> str:
+    """Render the step-by-step section.
+
+    Design (per user feedback): a screenshot on EVERY step is visual noise. So:
+      * Show a compact, image-free checklist of every step with a ✓/✗ — the
+        full flow and the exact failure point at a glance.
+      * Embed SCREENSHOTS only for the important frames: the failing step(s),
+        or — on a fully passing run — just the final end-state as proof.
+    Every per-step screenshot is still saved to disk under reports/screenshots/;
+    we just don't dump all of them into the report."""
+    if not steps:
+        return ""
+    failed = [s for s in steps if s.get("status") == "failed"]
+
+    # Top callout naming the breaking step.
+    callout = ""
+    if failed:
+        f0 = failed[0]
+        err = ""
+        if f0.get("error"):
+            err = (f"<div class='step-error'>"
+                   f"{_esc(_shorten(f0.get('error'), 400))}</div>")
+        callout = (
+            f"<div class='step-failcallout'>❌ Failed at step "
+            f"{_esc(f0.get('index'))}: <strong>{_esc(f0.get('keyword', ''))} "
+            f"{_esc(f0.get('name', ''))}</strong>{err}</div>"
+        )
+
+    # Compact checklist of every step (no images).
+    items = []
+    for s in steps:
+        is_fail = s.get("status") == "failed"
+        icon = ("<span class='fail-cell'>✗</span>" if is_fail
+                else "<span class='pass-cell'>✓</span>")
+        items.append(
+            f"<li class='{'step-li-fail' if is_fail else ''}'>{icon} "
+            f"<span class='step-kw'>{_esc(s.get('keyword', ''))}</span> "
+            f"{_esc(s.get('name', ''))}</li>"
+        )
+    checklist = f"<ol class='step-checklist'>{''.join(items)}</ol>"
+
+    # Curated screenshots: failures, else just the final frame.
+    if failed:
+        shots, shots_title = failed, "Failure screenshot"
+    else:
+        shots, shots_title = steps[-1:], "Final state"
+    cards = [c for c in (_render_step_card(s) for s in shots) if c]
+    gallery = ""
+    if cards:
+        gallery = (f"<div class='step-shot-title'>{shots_title}</div>"
+                   f"<div class='step-grid'>{''.join(cards)}</div>")
+
+    return (
+        "<section><h2>Step-by-step</h2>"
+        f"{callout}{checklist}{gallery}</section>"
+    )
+
+
 def _classify_captured(entries: list[dict]) -> dict:
     """Bucket captures by their kind so the renderer can emit each section."""
     buckets = {
@@ -2260,6 +2453,52 @@ def _classify_captured(entries: list[dict]) -> dict:
         kind = (e.get("kind") or "value").strip()
         buckets[bucket_for_kind.get(kind, "values")].append(e)
     return buckets
+
+
+# Mirror of conftest.BACKEND_ERROR_MARKERS (kept local to avoid importing the
+# test module here). Phrases that mean a state-changing action was rejected.
+_BACKEND_ERROR_MARKERS = (
+    "already exists", "already in use", "already registered", "duplicate",
+    "exist", "exists",   # also catches "name exist" / "organization name exist"
+    "could not", "couldn't", "cannot be", "unable to", "failed to",
+    "was rejected", "not created", "not saved", "something went wrong",
+    "error:",
+)
+# Only values whose LABEL looks like an action result are scanned — so a
+# negative-path test that *records* an expected error elsewhere isn't flagged.
+_ACTION_RESULT_LABEL_HINTS = (
+    "response", "result", "toast", "confirmation", "outcome", "verdict",
+    "server",
+)
+
+
+def _detect_unhandled_backend_errors(buckets: dict) -> list[str]:
+    """Safety net: catch a backend rejection sitting in the captured output that
+    NO assertion/prerequisite flagged (i.e. a step def forgot to verify the
+    action). Conservative by design so it never trips a negative-path test that
+    legitimately verifies an error:
+      * only `value` entries whose label looks like an action result,
+      * only strong rejection markers,
+      * skip any text the test EXPECTED (a passed assertion's expected/actual)."""
+    expected: set[str] = set()
+    for a in buckets.get("assertions", []):
+        if a.get("passed"):
+            for k in ("expected", "actual"):
+                t = (a.get(k) or "").strip().lower()
+                if t:
+                    expected.add(t)
+    hits: list[str] = []
+    for v in buckets.get("values", []):
+        label = (v.get("label") or "").lower()
+        text = (v.get("value") or "").strip()
+        low = text.lower()
+        if not text or low in expected:
+            continue
+        if not any(h in label for h in _ACTION_RESULT_LABEL_HINTS):
+            continue
+        if any(m in low for m in _BACKEND_ERROR_MARKERS):
+            hits.append(f"{v.get('label')}: {text}")
+    return hits
 
 
 def _compute_verdict(
@@ -2298,6 +2537,14 @@ def _compute_verdict(
         if pytest_exit_code != 0:
             reasons.append(f"pytest exited with code {pytest_exit_code}")
         return ("FAIL", "fail", reasons)
+
+    # NOTE: we deliberately do NOT auto-fail on a backend-error string appearing
+    # in the captured output. Whether a message like "already exists" means PASS
+    # or FAIL is STATE- and STORY-specific (creating an org that exists = FAIL;
+    # adding a user who already exists = PASS "already present"). Each step def
+    # makes that judgment explicitly by reading the site, so a blanket scanner
+    # here would wrongly override those intentional verdicts. (_detect_unhandled_
+    # backend_errors remains available for diagnostics but is not applied.)
 
     if buckets["missing"]:
         reasons.append(
@@ -2358,6 +2605,65 @@ def _coverage_css() -> str:
     .pytest-summary div { font-size: 0.9rem; }
     .pytest-summary strong { display: block; font-size: 1.4rem;
                               color: #0f172a; }
+    /* ---- Step-by-step visual timeline ---- */
+    .step-failcallout { background: #fee2e2; color: #991b1b;
+                        border-left: 5px solid #dc2626; border-radius: 6px;
+                        padding: 12px 16px; margin-bottom: 1rem;
+                        font-size: 0.95rem; }
+    .step-grid { display: grid;
+                 grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                 gap: 16px; }
+    .step-checklist { margin: 0 0 1rem 0; padding-left: 1.4rem;
+                      font-size: 0.9rem; line-height: 1.9; color: #334155; }
+    .step-checklist li.step-li-fail { color: #991b1b; font-weight: 600; }
+    .step-checklist .step-kw { font-weight: 700; color: #1e293b; }
+    .step-shot-title { font-size: 0.78rem; text-transform: uppercase;
+                       letter-spacing: 0.04em; color: #64748b; font-weight: 600;
+                       margin-bottom: 8px; }
+    .step-card { border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;
+                 background: #fff; display: flex; flex-direction: column;
+                 max-width: 560px; }
+    .step-card.step-pass { border-left: 4px solid #10b981; }
+    .step-card.step-fail { border-left: 4px solid #dc2626;
+                           box-shadow: 0 0 0 2px #fecaca; }
+    .step-head { padding: 9px 12px; font-size: 0.85rem; line-height: 1.35;
+                 border-bottom: 1px solid #f1f5f9; }
+    .step-idx { display: inline-block; min-width: 1.5rem; height: 1.5rem;
+                line-height: 1.5rem; text-align: center; border-radius: 50%;
+                background: #f1f5f9; color: #475569; font-size: 0.75rem;
+                font-weight: 700; margin-right: 6px; }
+    .step-kw { font-weight: 700; color: #1e293b; }
+    .step-badge { float: right; font-size: 0.72rem; font-weight: 700;
+                  padding: 2px 8px; border-radius: 999px; }
+    .step-badge.step-pass { background: #d1fae5; color: #065f46; }
+    .step-badge.step-fail { background: #fee2e2; color: #991b1b; }
+    .step-shot { width: 100%; display: block; background: #f8fafc;
+                 border-top: 1px solid #f1f5f9; cursor: zoom-in; }
+    .step-noshot { padding: 24px 12px; text-align: center; color: #94a3b8;
+                   font-size: 0.82rem; font-style: italic; }
+    .step-error { margin-top: 6px; font-family: ui-monospace, monospace;
+                  font-size: 0.78rem; color: #b91c1c;
+                  white-space: pre-wrap; word-break: break-word; }
+    /* ---- Consolidated website-suite report ---- */
+    .verdict-chip { padding: 2px 10px; border-radius: 999px; font-size: 0.74rem;
+                    font-weight: 700; white-space: nowrap; }
+    .verdict-chip.pass    { background: #d1fae5; color: #065f46; }
+    .verdict-chip.fail,
+    .verdict-chip.blocked { background: #fee2e2; color: #991b1b; }
+    .verdict-chip.partial { background: #fef3c7; color: #92400e; }
+    .suite-story { border: 1px solid #e2e8f0; }
+    .suite-story-head { display: flex; align-items: center; gap: 10px;
+                        margin-bottom: 2px; }
+    .suite-num { display: inline-flex; align-items: center; justify-content: center;
+                 min-width: 1.7rem; height: 1.7rem; border-radius: 50%;
+                 background: #0f172a; color: #fff; font-size: 0.8rem;
+                 font-weight: 700; }
+    .suite-story-title { font-weight: 700; font-size: 1.05rem; flex: 1; }
+    .suite-story-meta { color: #64748b; font-size: 0.8rem; margin-bottom: 6px; }
+    .suite-story-meta code { background: #f1f5f9; padding: 1px 5px;
+                             border-radius: 4px; }
+    .suite-reasons { margin: 0 0 0.5rem 1.1rem; color: #475569;
+                     font-size: 0.85rem; }
     """
 
 
@@ -2506,6 +2812,12 @@ def build_inline_coverage_report(
         f"values captured</div>"
         f"</div></section>"
     )
+
+    # Step-by-step visual timeline (screenshots) — the headline visual: shows
+    # every step's pass/fail with a picture and points at the failing step.
+    step_timeline = _render_step_timeline(_load_step_trace())
+    if step_timeline:
+        sections_html.append(step_timeline)
 
     # Prerequisites
     if buckets["prerequisites"]:
@@ -4507,6 +4819,300 @@ def render_sidebar(stories_n: int, story_id: str,
     return gen_clicked, fw_clicked, run_clicked
 
 
+# ============================================================
+# Website test suites — run every story built for one application
+# back-to-back, then emit a single consolidated, story-by-story report.
+# ============================================================
+
+_SUITE_URL_RE = re.compile(r"https?://[^\s\"'<>)]+", re.IGNORECASE)
+
+# For now the Website-suites tab only surfaces these applications (by app_id /
+# top-level projects/ folder name). Set to an empty tuple to show EVERY
+# discovered website again.
+SUITE_VISIBLE_APPS = ("ra_demo_rlcatalyst_com", "www_saucedemo_com")
+
+# Optional per-app execution order. Each fragment is matched (case-insensitive)
+# against a story's feature filename / story_id / title; listed stories run in
+# this order and any not listed fall to the end (by story_id). Lets a website's
+# tests run as a logical workflow instead of alphabetically.
+SUITE_STORY_ORDER = {
+    "ra_demo_rlcatalyst_com": [
+        "create_organization",   # 1. create the organization
+        "add_new_user",          # 2. add a user to it
+        "delete_user",           # 3. delete that user
+    ],
+}
+
+
+def _suite_order_key(story: dict, hints: list[str]):
+    hay = f"{story.get('feature','')} {story.get('story_id','')} {story.get('title','')}".lower()
+    for i, frag in enumerate(hints):
+        if frag.lower() in hay:
+            return (i, "")
+    return (len(hints), story.get("story_id", ""))
+
+
+def _first_url(*texts: str) -> str:
+    for t in texts:
+        if not t:
+            continue
+        m = _SUITE_URL_RE.search(t)
+        if m:
+            return m.group(0).rstrip(".,);")
+    return ""
+
+
+def _host_label(url: str, fallback: str) -> str:
+    if url:
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc
+            if "@" in host:          # strip basic-auth creds (user:pass@host)
+                host = host.split("@")[-1]
+            if host:
+                return host
+        except Exception:
+            pass
+    return fallback
+
+
+def _feature_title(feature_path: Path) -> str:
+    """Human title for a feature: prefer the Scenario: line, then Feature:,
+    then a prettified file stem."""
+    feat_fallback = ""
+    try:
+        for line in feature_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            low = s.lower()
+            if low.startswith("scenario:"):
+                t = s.split(":", 1)[1].strip()
+                if t:
+                    return t
+            elif low.startswith("feature:") and not feat_fallback:
+                feat_fallback = s.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    if feat_fallback:
+        return feat_fallback
+    stem = re.sub(r"^story_\d+_", "", feature_path.stem)
+    return stem.replace("_", " ").strip().capitalize() or feature_path.stem
+
+
+def discover_app_suites() -> list[dict]:
+    """Group every runnable story project (has features + tests) by its
+    application. Returns [{app_id, host, base_url, stories:[{story_id, title,
+    feature, test_file, url, story_text}]}], sorted by app_id."""
+    if not PROJECTS_DIR.exists():
+        return []
+    apps: dict[str, dict] = {}
+    for feat_dir in sorted(PROJECTS_DIR.glob("**/features")):
+        proj = feat_dir.parent
+        rel_parts = proj.relative_to(PROJECTS_DIR).parts
+        # Skip the per-app _shared/ folder and any hidden/stashed dir
+        # (e.g. .demo_stash) — those aren't runnable stories.
+        if "_shared" in rel_parts or any(p.startswith(".") for p in rel_parts):
+            continue
+        features = sorted(feat_dir.glob("*.feature"))
+        tests_dir = proj / "tests"
+        tests = sorted(tests_dir.glob("test_*.py")) if tests_dir.exists() else []
+        if not features or not tests:
+            continue
+        rel = proj.relative_to(PROJECTS_DIR)
+        story_id = str(rel).replace("\\", "/")
+        story_text = ""
+        st_path = proj / "user_story.txt"
+        if st_path.exists():
+            try:
+                story_text = st_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                story_text = ""
+        try:
+            feat_text = features[0].read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            feat_text = ""
+        url = _first_url(story_text, feat_text)
+        parts = rel.parts
+        app_id = parts[0] if len(parts) > 1 else _host_label(url, parts[0])
+        host = _host_label(url, app_id)
+        entry = apps.setdefault(
+            app_id, {"app_id": app_id, "host": host, "base_url": url, "stories": []}
+        )
+        if url and not entry["base_url"]:
+            entry["base_url"] = url
+        if host and host != app_id:
+            entry["host"] = host
+        entry["stories"].append({
+            "story_id": story_id,
+            "title": _feature_title(features[0]),
+            "feature": features[0].name,
+            "test_file": tests[0].name,
+            "url": url,
+            "story_text": story_text,
+        })
+    out = []
+    for app_id in sorted(apps):
+        a = apps[app_id]
+        hints = SUITE_STORY_ORDER.get(app_id, [])
+        a["stories"].sort(key=lambda s: _suite_order_key(s, hints))
+        out.append(a)
+    return out
+
+
+def _capture_suite_story_result(story_id: str, title: str, story_text: str,
+                                rc: int) -> dict:
+    """Right after a story's pytest finished, read its captured values + step
+    trace and build a SELF-CONTAINED per-story result for the suite report.
+    Screenshots for the frames we'll display are embedded as base64 NOW, before
+    the next story's run overwrites reports/screenshots/."""
+    entries = _load_captured_values()
+    buckets = _classify_captured(entries)
+    verdict, css_class, reasons = _compute_verdict(buckets, rc)
+    steps = _load_step_trace()
+    failed = [s for s in steps if s.get("status") == "failed"]
+    to_embed = failed or (steps[-1:] if steps else [])
+    for s in to_embed:
+        if s.get("screenshot") and not s.get("_datauri"):
+            s["_datauri"] = _img_data_uri(s.get("screenshot"))
+    return {
+        "story_id": story_id,
+        "title": title,
+        "story_text": story_text,
+        "verdict": verdict,
+        "css_class": css_class,
+        "reasons": reasons,
+        "rc": rc,
+        "steps": steps,
+        "n_steps": len(steps),
+        "n_failed": len(failed),
+    }
+
+
+def build_suite_report(app_id: str, host: str, results: list[dict],
+                       run_timestamp: str) -> str:
+    """Consolidated, story-by-story HTML for one website's suite run. Each story
+    shows its verdict, reasons, a compact step checklist, and (on failure) the
+    failure screenshot — all inlined, so the file is shareable on its own."""
+    total = len(results)
+    passed = sum(1 for r in results if r["verdict"] == "PASS")
+    failed = sum(1 for r in results if r["verdict"] in ("FAIL", "BLOCKED"))
+    partial = sum(1 for r in results if r["verdict"] == "PARTIAL")
+    overall_css = "pass" if (failed == 0 and partial == 0 and total) else (
+        "fail" if failed else "partial")
+
+    vlabel = {"PASS": "✓ PASS", "PARTIAL": "⚠ PARTIAL",
+              "FAIL": "❌ FAIL", "BLOCKED": "🚫 BLOCKED"}
+
+    rows = "".join(
+        f"<tr><td>{i}</td><td>{_esc(r['title'])}</td>"
+        f"<td><span class='verdict-chip {r['css_class']}'>{_esc(r['verdict'])}</span></td>"
+        f"<td>{r['n_failed']}/{r['n_steps']}</td></tr>"
+        for i, r in enumerate(results, 1)
+    )
+    summary_table = (
+        "<table><thead><tr><th>#</th><th>User story</th><th>Verdict</th>"
+        "<th>Failed / steps</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    )
+
+    story_sections = []
+    for i, r in enumerate(results, 1):
+        reasons_html = "".join(f"<li>{_esc(x)}</li>" for x in r["reasons"])
+        timeline = _render_step_timeline(r["steps"])
+        story_sections.append(
+            f"<section class='suite-story'>"
+            f"<div class='suite-story-head'>"
+            f"<span class='suite-num'>{i}</span>"
+            f"<span class='suite-story-title'>{_esc(r['title'])}</span>"
+            f"<span class='verdict-chip {r['css_class']}'>"
+            f"{vlabel.get(r['verdict'], r['verdict'])}</span></div>"
+            f"<div class='suite-story-meta'>story: <code>{_esc(r['story_id'])}</code>"
+            f" · {r['n_steps']} steps · {r['n_failed']} failed · exit {r['rc']}</div>"
+            f"<ul class='suite-reasons'>{reasons_html}</ul>"
+            f"{timeline}</section>"
+        )
+
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Suite report — {_esc(host)} — {_esc(run_timestamp)}</title>
+<style>{_coverage_css()}</style></head>
+<body><div class="container">
+  <h1>Website test suite — {_esc(host)}</h1>
+  <div class="subtitle">Run: <code>{_esc(run_timestamp)}</code> ·
+       App: <code>{_esc(app_id)}</code> · {total} test(s) run</div>
+  <div class="verdict-banner {overall_css}">
+    <span class="label">{passed}/{total} passed</span>
+    <ul><li>{passed} passed · {failed} failed · {partial} partial</li></ul>
+  </div>
+  <section><h2>Summary</h2>{summary_table}</section>
+  {''.join(story_sections)}
+</div></body></html>"""
+
+
+def render_suites_panel() -> dict | None:
+    """Website-level suite runner tab. Lists each application's stories with
+    deselectable checkboxes and a 'Run all' button. Returns a run request dict
+    when a button is clicked, else None. Also shows the last consolidated report."""
+    st.markdown(
+        '<div class="section-heading">🌐 Website test suites</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Run every test built for a website back-to-back (headed), then get one "
+        "consolidated, story-by-story report with a screenshot on each failure."
+    )
+    suites = discover_app_suites()
+    if SUITE_VISIBLE_APPS:
+        suites = [a for a in suites if a["app_id"] in SUITE_VISIBLE_APPS]
+    request: dict | None = None
+    if not suites:
+        st.info("No runnable website suites yet — generate tests for a website first.")
+    for a in suites:
+        app_id, host = a["app_id"], a["host"]
+        with st.expander(f"🌐 {host}  ·  {len(a['stories'])} test(s)", expanded=True):
+            if a.get("base_url"):
+                st.caption(a["base_url"])
+            selected = []
+            for s in a["stories"]:
+                checked = st.checkbox(
+                    f"{s['title']}",
+                    value=True,
+                    key=f"suitechk_{app_id}_{s['story_id']}",
+                    help=f"{s['story_id']} · {s['feature']}",
+                )
+                if checked:
+                    selected.append(s)
+            if st.button(
+                f"▶ Run all checked tests ({len(selected)})",
+                key=f"runsuite_{app_id}",
+                type="primary",
+                disabled=not selected,
+                use_container_width=True,
+            ):
+                request = {"app_id": app_id, "host": host, "stories": selected}
+
+    # Show the most recent consolidated report (persisted across reruns).
+    meta = st.session_state.get("suite_report_meta")
+    html = st.session_state.get("suite_report_html")
+    if html and meta:
+        st.markdown(
+            f'<div class="section-heading" style="margin-top:1.25rem;">'
+            f'📋 Latest suite report — {meta["host"]} '
+            f'({meta["passed"]}/{meta["total"]} passed)</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "⬇ Download suite_report.html",
+            data=html.encode("utf-8"),
+            file_name=f"suite_report_{meta['host']}_{meta['ts']}.html",
+            mime="text/html",
+            key="dl_suite_report",
+        )
+        try:
+            import streamlit.components.v1 as components
+            components.html(html, height=900, scrolling=True)
+        except Exception:
+            pass
+    return request
+
+
 def main() -> None:
     st.set_page_config(page_title="QE Agent", layout="wide", initial_sidebar_state="expanded")
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -4656,7 +5262,9 @@ def main() -> None:
         len(stories), story_id, gherkin_done, framework_done,
     )
 
-    tab_features, tab_framework, tab_results = st.tabs(["Feature files", "Framework code", "Test results"])
+    tab_features, tab_framework, tab_results, tab_suites = st.tabs(
+        ["Feature files", "Framework code", "Test results", "Website suites"]
+    )
     no_story_msg = (
         '<div class="empty-state"><strong>No story entered.</strong><br>'
         "Paste or upload a user story in the sidebar to begin.</div>"
@@ -4670,6 +5278,7 @@ def main() -> None:
     loaded_for = st.session_state.get("loaded_for_story")
     show_for_story = (loaded_for == story_id) and bool(story_id)
     runner_target: str | None = None
+    suite_request: dict | None = None
     with tab_features:
         if not story_id:
             st.markdown(no_story_msg, unsafe_allow_html=True)
@@ -4692,6 +5301,8 @@ def main() -> None:
         else:
             runner_target = render_test_runner(story_id, framework_done)
             render_test_results(story_id)
+    with tab_suites:
+        suite_request = render_suites_panel()
 
     # Sidebar "Run All" or per-test "▶ Run" both feed the same handler.
     pytest_target = "all" if run_clicked else runner_target
@@ -4967,6 +5578,15 @@ def main() -> None:
                         log_placeholder, st.session_state.log,
                         story_id=story_id, heartbeat_secs=10,
                     )
+                    # Deterministically register step-def modules so the very
+                    # next ③ Run resolves steps even if the LLM forgot to touch
+                    # pytest_plugins (the common failure mode).
+                    registered = sync_pytest_plugins()
+                    append_process_log(
+                        story_id,
+                        "pytest_plugins set to: "
+                        + (", ".join(registered) if registered else "(none)"),
+                    )
                     ok, errs = syntax_check_generated()
                     n_tests = len(list(TESTS_DIR.glob("test_*.py")))
                     n_pages = len([p for p in PAGES_DIR.glob("*.py")
@@ -5054,6 +5674,14 @@ def main() -> None:
         append_process_log(story_id, f"{label} clicked")
         # Make sure the working set reflects this story's folder before pytest runs
         restore_artifacts(story_id)
+        # Deterministically register the story's step-def modules. Never rely on
+        # the LLM to have populated pytest_plugins — if it didn't, pytest-bdd
+        # finds zero steps and every scenario fails with StepDefinitionNotFound.
+        registered = sync_pytest_plugins()
+        log_event(
+            "Step-def modules registered in conftest pytest_plugins: "
+            + (", ".join(registered) if registered else "(none found)")
+        )
         with st.status(f"Running pytest in headed mode — {label} ...", expanded=True) as status:
             clean_reports()
             ALLURE_RESULTS.mkdir(parents=True, exist_ok=True)
@@ -5108,6 +5736,95 @@ def main() -> None:
             f"%H:%M:%S · {'run-all' if is_all else 'run-single'}"
         )
         st.session_state.loaded_for_story = story_id
+        st.rerun()
+
+    # ---- Run a whole website suite (every checked story, one after another) ----
+    if suite_request:
+        app_id = suite_request["app_id"]
+        host = suite_request["host"]
+        suite_stories = suite_request["stories"]
+        run_ts = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_event(
+            f"▶ Website suite '{host}' — running {len(suite_stories)} test(s) "
+            f"one by one"
+        )
+        results: list[dict] = []
+        with st.status(
+            f"Running suite: {host} — {len(suite_stories)} test(s)…",
+            expanded=True,
+        ) as status:
+            for idx, s in enumerate(suite_stories, 1):
+                sid = s["story_id"]
+                title = s.get("title") or sid
+                status.update(
+                    label=f"[{idx}/{len(suite_stories)}] {title} — running…"
+                )
+                log_event(f"[{idx}/{len(suite_stories)}] {title} — preparing workspace")
+                # Isolate THIS story's artifacts: wipe the workspace, restore the
+                # story, register its steps. Without the wipe, a previous story's
+                # test files would linger and run too.
+                clean_artifacts(scope="all")
+                restore_artifacts(sid)
+                sync_pytest_plugins()
+                clean_reports()
+                ALLURE_RESULTS.mkdir(parents=True, exist_ok=True)
+                rc = stream_command(
+                    pytest_headed_cmd(None),
+                    log_placeholder, st.session_state.log,
+                    story_id=sid, heartbeat_secs=10,
+                )
+                # Per-story report + history snapshot (same as a single ③ run).
+                try:
+                    write_inline_coverage_report(sid, rc)
+                    archive_artifacts(sid, phase="run")
+                except Exception as exc:
+                    log_event(f"⚠ per-story report failed for {sid}: {exc}")
+                res = _capture_suite_story_result(sid, title, s.get("story_text", ""), rc)
+                results.append(res)
+                log_event(
+                    f"[{idx}/{len(suite_stories)}] {title} — {res['verdict']} "
+                    f"(exit {rc})"
+                )
+
+            suite_html = build_suite_report(app_id, host, results, run_ts)
+            # Durable snapshot first (survives the workspace restore below, which
+            # cleans reports/). The convenience copy in reports/ is (re)written
+            # AFTER the restore so it isn't wiped.
+            try:
+                snap = PROJECTS_DIR / app_id / "_suite_runs" / run_ts
+                snap.mkdir(parents=True, exist_ok=True)
+                (snap / "suite_report.html").write_text(suite_html, encoding="utf-8")
+            except OSError:
+                pass
+            n_pass = sum(1 for r in results if r["verdict"] == "PASS")
+            status.update(
+                label=f"Suite finished — {n_pass}/{len(results)} passed",
+                state="complete" if n_pass == len(results) else "error",
+            )
+
+        # Restore the user's current story so the other tabs stay consistent.
+        if story_id:
+            try:
+                clean_artifacts(scope="all")
+                restore_artifacts(story_id)
+                sync_pytest_plugins()
+            except Exception:
+                pass
+        # Now write the convenience copy (post-restore so it persists).
+        try:
+            REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            (REPORTS_DIR / "suite_report.html").write_text(suite_html, encoding="utf-8")
+        except OSError:
+            pass
+        st.session_state["suite_report_html"] = suite_html
+        st.session_state["suite_report_meta"] = {
+            "host": host, "app_id": app_id, "ts": run_ts,
+            "passed": n_pass, "total": len(results),
+        }
+        log_event(
+            f"📊 Consolidated suite report ready — {n_pass}/{len(results)} passed "
+            f"· saved reports/suite_report.html"
+        )
         st.rerun()
 
 

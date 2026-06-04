@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
 
-pytest_plugins = ()
+pytest_plugins = ('step_defs.story_1_create_organization_relevance_lab_steps',)
 
 # Captured-values log: a per-session record of every value the test extracted,
 # every assertion expected-vs-actual, every aggregate-sum check. The Auditor
@@ -16,13 +16,35 @@ pytest_plugins = ()
 # Cleared at session start; appended throughout the run.
 _CAPTURED_VALUES_PATH = Path("reports") / "captured_values.json"
 
+# Per-step visual trace: one entry per Gherkin step (Given/When/Then), each with
+# a Playwright screenshot of the page right after that step ran and a pass/fail
+# status. The inline coverage report reads this to render a step-by-step gallery
+# so a failure shows EXACTLY which step broke, with a picture. Reset each run.
+_STEP_TRACE_PATH = Path("reports") / "step_trace.json"
+_STEP_SCREENSHOT_DIR = Path("reports") / "screenshots"
+
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """Reset the captured-values log at the start of every pytest invocation."""
+    """Reset the captured-values log + step trace + screenshots at the start of
+    every pytest invocation so each run's report reflects only this run."""
     try:
         _CAPTURED_VALUES_PATH.parent.mkdir(parents=True, exist_ok=True)
         if _CAPTURED_VALUES_PATH.exists():
             _CAPTURED_VALUES_PATH.unlink()
+    except OSError:
+        pass
+    try:
+        if _STEP_TRACE_PATH.exists():
+            _STEP_TRACE_PATH.unlink()
+    except OSError:
+        pass
+    # Clear stale per-step screenshots so a shorter run can't leave higher-index
+    # frames from a previous, longer run lying around.
+    import shutil as _shutil
+    try:
+        if _STEP_SCREENSHOT_DIR.exists():
+            _shutil.rmtree(_STEP_SCREENSHOT_DIR, ignore_errors=True)
+        _STEP_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
 
@@ -56,6 +78,32 @@ def _median(xs):
     n = len(s)
     mid = n // 2
     return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+# Phrases that mean the application REJECTED a state-changing action
+# (create / add / submit / save / update / register). When the backend says any
+# of these — e.g. a toast reading "user already exists" — the action did NOT
+# complete, so the test must FAIL there. Used by CaptureLog.assert_action_succeeded
+# and mirrored by the report's verdict safety-net in agent_ui.py.
+BACKEND_ERROR_MARKERS = (
+    "already exists", "already in use", "already registered", "already taken",
+    "exist", "exists",   # also catches "name exist" / "name already exist"
+    "duplicate", "error:", "could not", "couldn't", "cannot ", "can't ",
+    "unable to", "failed to", "failure", "was rejected", "rejected",
+    "not created", "not saved", "not added", "invalid", "denied",
+    "forbidden", "something went wrong", "please try again",
+)
+
+
+def looks_like_backend_error(text: str) -> bool:
+    """True if `text` (a toast / server message captured right after an action)
+    reads like the backend rejected that action. Callers typically pass an
+    error-toast string, where any content already signals trouble — the marker
+    list just makes the intent explicit and catches generic messages too."""
+    if not text:
+        return False
+    low = " " + str(text).strip().lower() + " "
+    return any(m in low for m in BACKEND_ERROR_MARKERS)
 
 
 class CaptureLog:
@@ -367,6 +415,45 @@ class CaptureLog:
                 msg += f" | evidence: {evidence}"
             raise AssertionError(msg)
 
+    def assert_action_succeeded(self, label: str, *, error_text: str = "",
+                                positive_signal=None, reason: str = "",
+                                evidence: str = "") -> None:
+        """Verify a state-changing action (create / add / submit / save /
+        update / register) ACTUALLY succeeded on THIS run — the report-is-truth
+        rule applied to actions. Use this after any step that submits a form or
+        triggers a mutation.
+
+        error_text:      the backend's error toast / message captured right
+                         after the action (empty string if none appeared). ANY
+                         error-looking content here means the action was
+                         REJECTED → failure. Detection via looks_like_backend_error.
+        positive_signal: optional explicit proof the action happened on THIS run
+                         (e.g. the list count incremented, a success toast
+                         appeared). If you pass it, it must be truthy.
+
+        A pre-existing matching row is NOT proof of success — pass the
+        count-incremented / success-toast signal as `positive_signal` instead.
+
+        Records a blocking outcome (via assert_prerequisite) and RAISES on
+        failure so the scenario halts at the broken action."""
+        err = (error_text or "").strip()
+        # Many sites reuse ONE toast component for BOTH success and error
+        # messages, so a non-empty toast is NOT automatically a failure. Classify
+        # by content: only fail when the text actually reads like a rejection
+        # ("already exists" / "name exist" / "could not" / "failed" …). A success
+        # toast such as "created successfully" must NOT be treated as an error.
+        is_error = looks_like_backend_error(err)
+        ok = (not is_error) and (positive_signal is not False)
+        if is_error:
+            cause = f"backend rejected the action — {err!r}; it did not complete on this run"
+        elif positive_signal is False:
+            cause = reason or "no confirmation the action completed on this run"
+        else:
+            cause = ""
+        self.assert_prerequisite(
+            label, condition=ok, reason=cause, evidence=(evidence or err),
+        )
+
     def assert_in_range(self, label: str, *, actual, low, high) -> bool:
         """Check `low <= actual <= high`. Useful for bounded values."""
         a, lo, hi = _to_num(actual), _to_num(low), _to_num(high)
@@ -647,6 +734,85 @@ def browser(playwright_instance: Playwright, pytestconfig: pytest.Config) -> Bro
     browser.close()
 
 
+# ============================================================
+# Per-step visual trace (screenshots for the report)
+# ============================================================
+
+def _resolve_step_page(step_func_args, request):
+    """Best-effort handle to the Page the step acted on. Prefer the step's own
+    `page` arg; fall back to the already-created `page` fixture. Never raises."""
+    page = None
+    if isinstance(step_func_args, dict):
+        page = step_func_args.get("page")
+    if page is None:
+        try:
+            page = request.getfixturevalue("page")
+        except Exception:
+            page = None
+    return page if isinstance(page, Page) else None
+
+
+def _next_step_index() -> int:
+    try:
+        if _STEP_TRACE_PATH.exists():
+            existing = json.loads(
+                _STEP_TRACE_PATH.read_text(encoding="utf-8")
+            ).get("steps", [])
+            return len(existing) + 1
+    except (OSError, ValueError):
+        pass
+    return 1
+
+
+def _append_step_trace(entry: dict) -> None:
+    try:
+        _STEP_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {"steps": []}
+        if _STEP_TRACE_PATH.exists():
+            try:
+                data = json.loads(_STEP_TRACE_PATH.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {"steps": []}
+        data.setdefault("steps", []).append(entry)
+        _STEP_TRACE_PATH.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _capture_step(step, step_func_args, request, *, status: str,
+                  error: str = "") -> None:
+    """Record one step into the trace and snap a viewport screenshot of the
+    page in its post-step state. Viewport (not full_page) keeps frames a clean,
+    uniform size for the report gallery. Entirely best-effort — a screenshot
+    failure must never break the test run."""
+    idx = _next_step_index()
+    keyword = (getattr(step, "keyword", "") or "").strip()
+    name = (getattr(step, "name", "") or "").strip()
+    page = _resolve_step_page(step_func_args, request)
+    shot_rel = ""
+    if page is not None:
+        try:
+            _STEP_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            safe_kw = (keyword or "step").lower().replace(" ", "_")
+            fname = f"step_{idx:02d}_{safe_kw}_{status}.png"
+            page.screenshot(path=str(_STEP_SCREENSHOT_DIR / fname),
+                            full_page=False)
+            shot_rel = f"screenshots/{fname}"
+        except Exception:
+            shot_rel = ""
+    _append_step_trace({
+        "index": idx,
+        "keyword": keyword,
+        "name": name,
+        "status": status,
+        "error": str(error or ""),
+        "screenshot": shot_rel,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
+
+
 # Per-BDD-step delay (only when headed). The audience sees each Given/When/Then
 # fully complete before the next starts — gives time to read the step name in
 # the trace + watch the page settle. Override via STEP_DELAY_SEC env var.
@@ -656,6 +822,10 @@ def browser(playwright_instance: Playwright, pytestconfig: pytest.Config) -> Bro
 def pytest_bdd_after_step(
     request, feature, scenario, step, step_func, step_func_args
 ) -> None:
+    # Only successful steps reach `after_step`; the failing one goes to
+    # `pytest_bdd_step_error` below. So this records every PASSED step.
+    _capture_step(step, step_func_args, request, status="passed")
+
     is_headed = bool(request.config.getoption("headed", default=False))
     default_delay = 1.5 if is_headed else 0.0
     import os as _os
@@ -665,6 +835,15 @@ def pytest_bdd_after_step(
         delay = default_delay
     if delay > 0:
         time.sleep(delay)
+
+
+def pytest_bdd_step_error(
+    request, feature, scenario, step, step_func, step_func_args, exception
+) -> None:
+    """The step that raised. Snap it and mark it FAILED so the report can point
+    straight at the breaking step with a screenshot of the page at that moment."""
+    _capture_step(step, step_func_args, request, status="failed",
+                  error=exception)
 
 
 @pytest.fixture()
